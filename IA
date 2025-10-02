@@ -5,3 +5,443 @@ git commit -m "first commit"
 git branch -M main
 git remote add origin https://github.com/LHDMT/Meu-app.git
 git push -u origin main
+set -e
+
+# === Estrutura do projeto ===
+mkdir -p evoia/{app/{core,static,templates},models}
+cd evoia
+
+# === .gitignore ===
+cat > .gitignore <<'EOF'
+__pycache__/
+*.pyc
+.venv/
+.env
+models/
+EOF
+
+# === requirements ===
+cat > requirements.txt <<'EOF'
+fastapi==0.112.2
+uvicorn[standard]==0.30.6
+pydantic==2.9.1
+scikit-learn==1.5.2
+joblib==1.4.2
+numpy==1.26.4
+EOF
+
+# === README (resumo) ===
+cat > README.md <<'EOF'
+# EvoIA (MVP)
+Transforma pedidos em linguagem natural em um plano de IA, treina um modelo inicial e evolui automaticamente.
+
+Rotas:
+- POST /build-ai        -> gera plano + treina baseline
+- POST /evolve          -> meta-aprendizado (busca aleatória de hiperparâmetros)
+- POST /predict         -> previsões com o modelo salvo
+- GET  /                -> interface no-code (chat)
+
+Rodar:
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+EOF
+
+# === app/__init__.py ===
+cat > app/__init__.py <<'EOF'
+# evoia package
+EOF
+
+# === app/core/planner.py (Interface No-Code -> extrai plano a partir do texto) ===
+cat > app/core/planner.py <<'EOF'
+from typing import Dict
+
+def infer_plan(nl_request: str) -> Dict:
+    """Extrai um plano de IA (domínio, tarefa, features, métricas) a partir de texto livre."""
+    req = nl_request.lower()
+
+    # Heurísticas simples (MVP). Depois pode plugar um LLM/NLP de verdade aqui.
+    if any(k in req for k in ["safra", "agro", "drone", "clima", "ndvi"]):
+        return {
+            "domain": "agro",
+            "task": "regression",
+            "target": "yield",
+            "features": ["ndvi","rain","temp","soil"],
+            "metrics": ["r2","mae"],
+            "notes": "Baseline RandomForestRegressor; dados sintéticos simulam NDVI/chuva/temperatura/solo."
+        }
+
+    if any(k in req for k in ["emoç", "sentimento", "vendas", "cliente", "churn", "ligação", "call"]):
+        return {
+            "domain": "sales",
+            "task": "classification",
+            "target": "churn_risk",
+            "features": ["call_score","talk_ratio","silence","overlap"],
+            "metrics": ["f1","roc_auc"],
+            "notes": "Baseline LogisticRegression; dados sintéticos simulam métricas de chamadas."
+        }
+
+    # Genérico (fallback)
+    return {
+        "domain": "generic",
+        "task": "regression",
+        "target": "target",
+        "features": ["f1","f2","f3"],
+        "metrics": ["r2","mae"],
+        "notes": "Fallback com RandomForestRegressor e dados sintéticos."
+    }
+EOF
+
+# === app/core/automl.py (Núcleo Auto-Evolutivo + Meta-Aprendizado) ===
+cat > app/core/automl.py <<'EOF'
+import os
+from typing import Dict, Tuple, Any
+import numpy as np
+from joblib import dump, load
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_absolute_error, f1_score, roc_auc_score
+
+MODELS_DIR = "models"
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+def _synthetic_agro_regression(n:int=800) -> Tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(42)
+    ndvi = rng.uniform(0.2, 0.9, n)
+    rain = rng.normal(120, 30, n)
+    temp = rng.normal(24, 4, n)
+    soil = rng.uniform(0.3, 0.8, n)
+    noise = rng.normal(0, 0.1, n)
+    y = 3.0*ndvi + 0.01*rain - 0.05*(temp-25)**2 + 1.5*soil + noise
+    X = np.column_stack([ndvi, rain, temp, soil]).astype(float)
+    return X, y
+
+def _synthetic_sales_classification(n:int=1000) -> Tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(13)
+    call_score = rng.uniform(0,1,n)
+    talk_ratio = rng.uniform(0.3,0.8,n)
+    silence = rng.uniform(0,0.4,n)
+    overlap = rng.uniform(0,0.2,n)
+    p = 0.6 - 0.5*call_score + 0.3*silence + 0.2*overlap + 0.2*(0.55 - talk_ratio)
+    p = 1/(1+np.exp(-5*p))
+    y = (rng.uniform(0,1,n) < p).astype(int)
+    X = np.column_stack([call_score,talk_ratio,silence,overlap]).astype(float)
+    return X, y
+
+def _generic_regression(n:int=600):
+    X = np.random.randn(n, 3)
+    y = X @ np.array([0.7, -0.2, 0.4]) + np.random.randn(n)*0.2
+    return X, y
+
+def _save_model(model: Any, domain: str, task: str) -> str:
+    path = os.path.join(MODELS_DIR, f"{domain}_{task}.joblib")
+    dump(model, path)
+    return path
+
+def train_initial(plan: Dict) -> Dict:
+    task = plan["task"]
+    domain = plan["domain"]
+
+    if domain == "agro" and task == "regression":
+        X, y = _synthetic_agro_regression()
+        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=7)
+        model = RandomForestRegressor(n_estimators=200, random_state=7)
+        model.fit(Xtr, ytr)
+        yhat = model.predict(Xte)
+        metrics = {"r2": float(r2_score(yte, yhat)), "mae": float(mean_absolute_error(yte, yhat))}
+        path = _save_model(model, domain, task)
+        return {"model_path": path, "metrics": metrics}
+
+    if domain == "sales" and task == "classification":
+        X, y = _synthetic_sales_classification()
+        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=7)
+        model = LogisticRegression(max_iter=300)
+        model.fit(Xtr, ytr)
+        yhat = model.predict(Xte)
+        metrics = {"f1": float(f1_score(yte, yhat))}
+        try:
+            proba = model.predict_proba(Xte)[:,1]
+            metrics["roc_auc"] = float(roc_auc_score(yte, proba))
+        except Exception:
+            pass
+        path = _save_model(model, domain, task)
+        return {"model_path": path, "metrics": metrics}
+
+    # fallback
+    X, y = _generic_regression()
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=7)
+    model = RandomForestRegressor(n_estimators=120, random_state=7)
+    model.fit(Xtr, ytr)
+    yhat = model.predict(Xte)
+    metrics = {"r2": float(r2_score(yte, yhat)), "mae": float(mean_absolute_error(yte, yhat))}
+    path = _save_model(model, domain, task)
+    return {"model_path": path, "metrics": metrics}
+
+def simple_evolve(plan: Dict, trials:int=8) -> Dict:
+    """Busca aleatória -> simula evolução/meta-aprendizado trocando hiperparâmetros."""
+    task = plan["task"]
+    domain = plan["domain"]
+    best = None
+
+    if domain == "agro" and task == "regression":
+        X, y = _synthetic_agro_regression()
+        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=11)
+        for _ in range(trials):
+            from sklearn.ensemble import RandomForestRegressor
+            n = np.random.randint(80, 401)
+            depth = np.random.randint(3, 16)
+            model = RandomForestRegressor(n_estimators=n, max_depth=depth, random_state=11)
+            model.fit(Xtr, ytr)
+            yhat = model.predict(Xte)
+            r2 = r2_score(yte, yhat)
+            mae = mean_absolute_error(yte, yhat)
+            score = r2 - 0.02*mae
+            if (best is None) or (score > best["score"]):
+                best = {"model": model, "r2": float(r2), "mae": float(mae), "score": float(score)}
+        path = _save_model(best["model"], domain, task)
+        return {"model_path": path, "metrics": {"r2": best["r2"], "mae": best["mae"]}, "trials": trials}
+
+    if domain == "sales" and task == "classification":
+        X, y = _synthetic_sales_classification()
+        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=11)
+        for _ in range(trials):
+            C = 10 ** np.random.uniform(-2, 1)
+            model = LogisticRegression(C=C, penalty="l2", solver="lbfgs", max_iter=400)
+            model.fit(Xtr, ytr)
+            yhat = model.predict(Xte)
+            f1 = f1_score(yte, yhat)
+            try:
+                roc = roc_auc_score(yte, model.predict_proba(Xte)[:,1])
+            except Exception:
+                roc = f1
+            score = 0.6*f1 + 0.4*roc
+            if (best is None) or (score > best["score"]):
+                best = {"model": model, "f1": float(f1), "roc_auc": float(roc), "score": float(score)}
+        path = _save_model(best["model"], domain, task)
+        return {"model_path": path, "metrics": {"f1": best["f1"], "roc_auc": best["roc_auc"]}, "trials": trials}
+
+    # fallback
+    X, y = _generic_regression()
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=11)
+    for _ in range(trials):
+        from sklearn.ensemble import RandomForestRegressor
+        n = np.random.randint(80, 301)
+        model = RandomForestRegressor(n_estimators=n, random_state=11)
+        model.fit(Xtr, ytr)
+        yhat = model.predict(Xte)
+        r2 = r2_score(yte, yhat)
+        mae = mean_absolute_error(yte, yhat)
+        score = r2 - 0.02*mae
+        if (best is None) or (score > best["score"]):
+            best = {"model": model, "r2": float(r2), "mae": float(mae), "score": float(score)}
+    path = _save_model(best["model"], domain, task)
+    return {"model_path": path, "metrics": {"r2": best["r2"], "mae": best["mae"]}, "trials": trials}
+
+def predict(domain: str, task: str, features: list, X: list):
+    """Carrega o modelo salvo e faz predição para um único registro (lista numérica)."""
+    path = os.path.join(MODELS_DIR, f"{domain}_{task}.joblib")
+    if not os.path.exists(path):
+        raise FileNotFoundError("Modelo não encontrado. Treine com /build-ai primeiro.")
+    model = load(path)
+    arr = np.array(X, dtype=float).reshape(1, -1)
+    y = model.predict(arr)
+    out = {"yhat": float(y[0])}
+    if hasattr(model, "predict_proba"):
+        try:
+            out["proba"] = float(model.predict_proba(arr)[0,1])
+        except Exception:
+            pass
+    return out
+EOF
+
+# === app/main.py (API + página no-code) ===
+cat > app/main.py <<'EOF'
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from app.core.planner import infer_plan
+from app.core.automl import train_initial, simple_evolve, predict
+
+app = FastAPI(title="EvoIA - MVP")
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+# -------- Schemas --------
+class BuildRequest(BaseModel):
+    description: str
+
+class EvolveRequest(BaseModel):
+    plan: dict
+    trials: int = 8
+
+class PredictRequest(BaseModel):
+    domain: str
+    task: str
+    features: list
+    values: list
+
+# -------- UI --------
+@app.get("/", response_class=HTMLResponse)
+def index():
+    with open("app/templates/index.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
+
+# -------- API --------
+@app.post("/build-ai")
+def build_ai(req: BuildRequest):
+    plan = infer_plan(req.description)
+    train = train_initial(plan)
+    return {"plan": plan, "train": train}
+
+@app.post("/evolve")
+def evolve(req: EvolveRequest):
+    result = simple_evolve(req.plan, trials=req.trials)
+    return {"evolved": result}
+
+@app.post("/predict")
+def do_predict(req: PredictRequest):
+    out = predict(req.domain, req.task, req.features, req.values)
+    return out
+EOF
+
+# === app/templates/index.html (Interface No-Code: chat simples) ===
+cat > app/templates/index.html <<'EOF'
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <title>EvoIA — No-Code</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #0b0f14; color: #e6edf3; }
+    header { padding: 16px 20px; border-bottom: 1px solid #1f2937; background: #0f1620; position: sticky; top:0; }
+    h1 { margin: 0; font-size: 18px; letter-spacing: .5px; }
+    .container { max-width: 960px; margin: 0 auto; padding: 20px; }
+    .card { background: #0f1720; border: 1px solid #1f2937; border-radius: 14px; padding: 16px; margin-bottom: 16px; }
+    .row { display: flex; gap: 10px; }
+    input, textarea, button { border-radius: 10px; border: 1px solid #1f2937; background: #0b1220; color: #e6edf3; }
+    textarea { width: 100%; min-height: 80px; padding: 12px; }
+    button { padding: 10px 14px; cursor: pointer; }
+    .pill { font-size: 12px; padding: 4px 8px; border: 1px solid #1f2937; border-radius: 999px; background:#0b1220; }
+    pre { white-space: pre-wrap; word-wrap: break-word; background: #0b1220; padding: 12px; border-radius: 10px; border:1px solid #1f2937; }
+    .small { opacity:.85; font-size: 12px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 768px){ .grid{ grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header><h1>EvoIA — Interface No-Code</h1></header>
+  <div class="container">
+    <div class="card">
+      <div class="small">Descreva sua IA em linguagem natural</div>
+      <textarea id="desc" placeholder='Ex.: "Quero prever minha safra com imagens de drone e clima."'></textarea>
+      <div class="row" style="margin-top:8px;">
+        <button onclick="buildAI()">Gerar Plano + Treinar</button>
+        <span id="status" class="pill">parado</span>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h3>Plano</h3>
+        <pre id="plan"></pre>
+      </div>
+      <div class="card">
+        <h3>Treino</h3>
+        <pre id="train"></pre>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content: space-between; align-items:center;">
+        <h3 style="margin:0;">Meta-Aprendizado (evolução)</h3>
+        <div>
+          <label class="small">trials:</label>
+          <input id="trials" type="number" min="2" max="50" value="8" style="width:80px; padding:6px 8px;">
+          <button onclick="evolve()">Evoluir</button>
+        </div>
+      </div>
+      <pre id="evolved"></pre>
+    </div>
+
+    <div class="card">
+      <h3>Prever (exemplo de features)</h3>
+      <div class="small" id="feat-help">As features dependem do plano gerado (ex.: agro = [ndvi, rain, temp, soil])</div>
+      <textarea id="values" placeholder="Digite uma linha de valores numéricos separados por vírgula, na ordem das features"></textarea>
+      <button onclick="predict()">Prever</button>
+      <pre id="pred"></pre>
+    </div>
+
+    <div class="small" style="opacity:.7; margin-top:12px;">
+      *MVP com dados sintéticos. Em produção, conecte NDVI/clima, CRM/voz, etc.
+    </div>
+  </div>
+
+  <script>
+    let lastPlan = null;
+    function setStatus(text){ document.getElementById('status').textContent = text; }
+    function show(el, data){ document.getElementById(el).textContent = JSON.stringify(data, null, 2); }
+
+    async function buildAI(){
+      setStatus('gerando...');
+      const description = document.getElementById('desc').value.trim();
+      if(!description){ alert('Descreva sua IA.'); setStatus('parado'); return; }
+      const r = await fetch('/build-ai', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ description })
+      });
+      const data = await r.json();
+      lastPlan = data.plan;
+      show('plan', data.plan);
+      show('train', data.train);
+      setStatus('pronto');
+      if (lastPlan?.features){
+        document.getElementById('feat-help').textContent =
+          'Features do plano: ' + JSON.stringify(lastPlan.features);
+      }
+    }
+
+    async function evolve(){
+      if(!lastPlan){ alert('Gere o plano e treine primeiro.'); return; }
+      const trials = parseInt(document.getElementById('trials').value || '8', 10);
+      const r = await fetch('/evolve', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ plan: lastPlan, trials })
+      });
+      const data = await r.json();
+      show('evolved', data);
+    }
+
+    async function predict(){
+      if(!lastPlan){ alert('Gere o plano e treine primeiro.'); return; }
+      const raw = document.getElementById('values').value.trim();
+      if(!raw){ alert('Informe valores, separados por vírgula.'); return; }
+      const vals = raw.split(',').map(v => Number(v.trim()));
+      const r = await fetch('/predict', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          domain: lastPlan.domain,
+          task: lastPlan.task,
+          features: lastPlan.features,
+          values: vals
+        })
+      });
+      const data = await r.json();
+      show('pred', data);
+    }
+  </script>
+</body>
+</html>
+EOF
+
+# === Ambiente Python ===
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+echo
+echo "✅ Pronto! Agora rode:"
+echo "uvicorn app.main:app --reload --port 8000"
+echo "e abra http://localhost:8000"
